@@ -1,8 +1,11 @@
-from infsystems.pgbus.bus_model import NoRetryException,PgBusRegistration
+from infsystems.pgbus.bus_model import NoRetryException,PgBusRegistration,PgBusHostSettings,PgBusMessage
 import infsystems.pgbus.pgbus_listener as pgbus_listener
-from infsystems.pgbus.PgBusSubProcessFork import *
-from infsystems.pgbus.PgBusHandlerContext import *
+from infsystems.pgbus.PgBusSubProcessFork import PgBusSubProcessFork
+from infsystems.pgbus.PgBusHandlerContext import PgBusHandlerContext
 from infsystems.pgbus.PgBus import PgBus
+from typing import Any
+import logging
+import asyncio
 from importlib import import_module
 import datetime
 import inspect
@@ -11,6 +14,7 @@ import asyncpg
 import psutil
 import uuid6
 import gc
+import traceback
 
 class PgBusHost:
     def __init__(self,
@@ -40,6 +44,7 @@ class PgBusHost:
         self._listener_map = dict()
         self._puller_tasks = list()
         self._context_object_in_proc = context_object_in_proc
+        self._queue_semaphores: dict[str, asyncio.Semaphore] = {}
         self.status: str | None = None
 
     def _get_process_memory(self) -> float:
@@ -47,7 +52,7 @@ class PgBusHost:
             process = psutil.Process()
             return process.memory_info().rss / (1024 ** 2)
         except (Exception,):
-            self._logger.exception(f"Error in calling memory_info", exc_info=True)
+            self._logger.exception("Error in calling memory_info", exc_info=True)
             return 0
 
     @staticmethod
@@ -284,9 +289,15 @@ class PgBusHost:
 
         self._logger.info(f'Starting the listeners for {queue_list} queues.')
 
+        workers_per_queue = max(1, self._setting.max_workers_per_queue)
+        self._queue_semaphores = {q: asyncio.Semaphore(workers_per_queue) for q in queue_list}
+
         # to process existing messages in the queue which were posted when no active listener existed
-        puller_tasks = [self._process_messages(queue_name) for queue_name in queue_list]
-        await asyncio.gather(*puller_tasks)
+        bootstrap_tasks = []
+        for queue_name in queue_list:
+            for _ in range(workers_per_queue):
+                bootstrap_tasks.append(self._launch_worker(queue_name))
+        await asyncio.gather(*bootstrap_tasks)
 
         listener = pgbus_listener.NotificationListener(self.connect_func())
 
@@ -295,7 +306,9 @@ class PgBusHost:
         await listener.run(
             {q: self._create_notification_handler(q) for q in queue_list},
             policy=pgbus_listener.ListenPolicy.LAST,
-            notification_timeout=self._setting.timeout_in_minutes * 60)
+            notification_timeout=self._setting.timeout_in_minutes * 60,
+            max_concurrency_per_channel=workers_per_queue,
+        )
 
     def _create_notification_handler(
             self,
@@ -308,57 +321,77 @@ class PgBusHost:
             if isinstance(notification, pgbus_listener.Timeout):
                 self._logger.debug(notification)
 
-            await self._process_messages(_queue_name)
+            await self._start_worker_if_available(_queue_name)
             self._logger.debug(f"Notification for {queue_name} has been received.")
 
         return notification_handler
 
-    async def _process_messages(self, channel: str):
-        async with self._bus.pool.acquire() as conn:
-            # looping to process all the existing messages in the queue
-            while not self._termination_requested:
-                async with conn.transaction():
+    async def _start_worker_if_available(self, queue_name: str) -> None:
+        semaphore = self._queue_semaphores[queue_name]
+        # Start as many workers as permits allow to quickly drain backlog.
+        while not semaphore.locked():
+            await self._launch_worker(queue_name)
 
-                    # fetch the top row and lock, skip it is locked by another session and go to the next
-                    message = await self._pull_and_lock(channel, conn)
+    async def _launch_worker(self, queue_name: str) -> None:
+        semaphore = self._queue_semaphores[queue_name]
+        await semaphore.acquire()
+        task = asyncio.create_task(
+            self._process_messages(queue_name, semaphore),
+            name=f"PgBusHost.{queue_name}"
+        )
+        self._puller_tasks.append(task)
+        task.add_done_callback(lambda t: self._puller_tasks.remove(t) if t in self._puller_tasks else None)
 
-                    if not message:
-                        return
+    async def _process_messages(self, channel: str, semaphore: asyncio.Semaphore | None = None):
+        try:
+            async with self._bus.pool.acquire() as conn:
+                # looping to process all the existing messages in the queue
+                while not self._termination_requested:
+                    async with conn.transaction():
 
-                    max_num_attempts = 1 if not self._setting.retry_count else self._setting.retry_count + 1
-                    attempt = 0
-                    while True:
-                        attempt += 1
-                        try:
-                            mem1 = self._get_process_memory()
-                            self._logger.debug(f"Total process memory (Mb) before handler execution : {mem1}")
-                            message_copy = message.model_copy(deep=True)
+                        # fetch the top row and lock, skip it is locked by another session and go to the next
+                        message = await self._pull_and_lock(channel, conn)
 
-                            await self._process_message(message_copy, conn)
-                            await self._add_to_message_log(message, conn)
-                            await self._delete_message(message, conn)
+                        if not message:
+                            return
 
-                            # successful completion of message processing, break the retry loop and go back to
-                            # the outer loop to process more messages
-                            break
-                        except NoRetryException:
-                            await self._move_to_dead_letter(message, traceback.format_exc(), conn)
-                            break
-                        except NotImplementedError:
-                            await self._move_to_dead_letter(message, traceback.format_exc(), conn)
-                            break
-                        except Exception as ex:
-                            if attempt == max_num_attempts:
+                        max_num_attempts = 1 if not self._setting.retry_count else self._setting.retry_count + 1
+                        attempt = 0
+                        while True:
+                            attempt += 1
+                            try:
+                                mem1 = self._get_process_memory()
+                                self._logger.debug(f"Total process memory (Mb) before handler execution : {mem1}")
+                                message_copy = message.model_copy(deep=True)
+
+                                await self._process_message(message_copy, conn)
+                                await self._add_to_message_log(message, conn)
+                                await self._delete_message(message, conn)
+
+                                # successful completion of message processing, break the retry loop and go back to
+                                # the outer loop to process more messages
+                                break
+                            except NoRetryException:
                                 await self._move_to_dead_letter(message, traceback.format_exc(), conn)
                                 break
-                            else:
-                                self._logger.exception(f"Attempt #{attempt} failed: {str(ex)}", exc_info=True)
-                                if self._termination_requested:
-                                    self._logger.warning('Termination has been requested, returning.')
-                                    return
-                                await asyncio.sleep(self._setting.retry_wait_time ** attempt)
-                        finally:
-                            del gc.garbage[:]
-                            gc.collect()
-                            mem2 = self._get_process_memory()
-                            self._logger.info(f"Change in process memory (Mb) after handler execution : {mem2 - mem1}")
+                            except NotImplementedError:
+                                await self._move_to_dead_letter(message, traceback.format_exc(), conn)
+                                break
+                            except Exception as ex:
+                                if attempt == max_num_attempts:
+                                    await self._move_to_dead_letter(message, traceback.format_exc(), conn)
+                                    break
+                                else:
+                                    self._logger.exception(f"Attempt #{attempt} failed: {str(ex)}", exc_info=True)
+                                    if self._termination_requested:
+                                        self._logger.warning('Termination has been requested, returning.')
+                                        return
+                                    await asyncio.sleep(self._setting.retry_wait_time ** attempt)
+                            finally:
+                                del gc.garbage[:]
+                                gc.collect()
+                                mem2 = self._get_process_memory()
+                                self._logger.info(f"Change in process memory (Mb) after handler execution : {mem2 - mem1}")
+        finally:
+            if semaphore:
+                semaphore.release()

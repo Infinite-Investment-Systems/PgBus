@@ -26,27 +26,27 @@ async def main():
         message_type='print',
         keep_log=True,
         handler_function='TestHandler.run',
-        run_as_subprocess=True))
+        run_as_subprocess=False))
 
     await bus_host.register(PgBusRegistration(
         queue_name='test',
         message_type='raise',
         keep_log=True,
         handler_function='TestHandler.run',
-        run_as_subprocess=True))
+        run_as_subprocess=False))
 
     await bus_host.register(PgBusRegistration(
         queue_name='test',
         message_type='sleep',
         handler_function='TestHandler.run',
         keep_log=True,
-        run_as_subprocess=True))
+        run_as_subprocess=False))
 
     await bus_host.register(PgBusRegistration(
         queue_name='test',
         message_type='defer',
         keep_log=True,
-        handler_function='TestHandler.run', run_as_subprocess=True ) )
+        handler_function='TestHandler.run', run_as_subprocess=False ) )
 
 
     for i in range(30):

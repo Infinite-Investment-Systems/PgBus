@@ -17,7 +17,7 @@ async def main():
     coloredlogs.install(level='DEBUG', logger=_logger)
     conn_str = os.getenv('POSTGRES_URL')
     pg_bus = await PgBus.from_connection_string(conn_str)
-    settings = PgBusHostSettings(retry_count=3, retry_wait_time=3)
+    settings = PgBusHostSettings(retry_count=3, retry_wait_time=3, max_workers_per_queue=3)
     bus_host = PgBusHost(
         bus=pg_bus,
         connection_string_bypassed_pgbouncer=conn_str,
