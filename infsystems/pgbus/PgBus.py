@@ -22,8 +22,8 @@ class PgBus(BasePgBus):
     async def from_connection_string(cls,
                                      connection_string: str,
                                      pool_name: str = 'PgBus-Pool',
-                                     min_pool_size: int | None = 1,
-                                     max_pool_size: int | None = 10) -> "PgBus":
+                                     min_pool_size: int  = 1,
+                                     max_pool_size: int  = 10) -> "PgBus":
         """
         Factory method to create an instance of this class with connection string
         Alternative is to construct with an injected asyncpg.Pool instance.
@@ -48,7 +48,7 @@ class PgBus(BasePgBus):
                       payload: str,
                       priority: int = 0,
                       correlation_key: str|None = None,
-                      conn: asyncpg.connection.Connection = None
+                      conn: asyncpg.connection.Connection|None = None
                       ) -> None:
 
         needs_new_conn = not conn

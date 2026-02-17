@@ -5,7 +5,8 @@ import enum
 import logging
 import sys
 import asyncpg
-from typing import Any, Callable, Coroutine, Dict, List, Optional, Union
+import random
+from typing import Any, Callable, Coroutine, Dict, List, Optional, Set, Union
 
 if sys.version_info < (3, 11, 0):
     from async_timeout import timeout
@@ -58,6 +59,7 @@ class NotificationListener:
         *,
         policy: ListenPolicy = ListenPolicy.ALL,
         notification_timeout: float = 30,
+        max_concurrency_per_channel: int = 1,
     ) -> None:
         queue_per_channel: Dict[str, "asyncio.Queue[Notification]"] = {
             channel: asyncio.Queue() for channel in handler_per_channel.keys()
@@ -77,6 +79,7 @@ class NotificationListener:
                     handler=handler,
                     policy=policy,
                     notification_timeout=notification_timeout,
+                    max_concurrency_per_channel=max_concurrency_per_channel,
                 ),
                 name=f"{__package__}.{channel}",
             )
@@ -103,31 +106,50 @@ class NotificationListener:
         handler: NotificationHandler,
         policy: ListenPolicy,
         notification_timeout: float,
+        max_concurrency_per_channel: int,
     ) -> None:
+        max_parallel = max(1, max_concurrency_per_channel)
+        inflight: Set["asyncio.Task[None]"] = set()
 
-        notification: NotificationOrTimeout
-        while True:
-            if notifications.empty():
-                if notification_timeout == NO_TIMEOUT:
-                    notification = await notifications.get()
-                else:
-                    try:
-                        async with timeout(notification_timeout):
-                            notification = await notifications.get()
-                    except asyncio.TimeoutError:
-                        notification = Timeout(channel)
-            else:
-                while not notifications.empty():
-                    notification = notifications.get_nowait()
-                    if policy == ListenPolicy.ALL:
-                        break
-
-            # to have independent async context per run
-            # to protect from misuse of contextvars
+        async def _invoke(notification: NotificationOrTimeout) -> None:
             try:
-                await asyncio.create_task(handler(notification), name=f"{__package__}.{channel}")
+                await handler(notification)
             except Exception:
                 logger.exception("Failed to handle %s", notification)
+
+        async def _dispatch(notification: NotificationOrTimeout, semaphore: "asyncio.Semaphore") -> None:
+            try:
+                await _invoke(notification)
+            finally:
+                semaphore.release()
+
+        semaphore = asyncio.Semaphore(max_parallel)
+
+        try:
+            while True:
+                try:
+                    if notification_timeout == NO_TIMEOUT:
+                        notification: NotificationOrTimeout = await notifications.get()
+                    else:
+                        async with timeout(notification_timeout):
+                            notification = await notifications.get()
+                except asyncio.TimeoutError:
+                    notification = Timeout(channel)
+
+                if policy == ListenPolicy.LAST:
+                    # Collapse backlog to the latest item when configured for LAST.
+                    while True:
+                        try:
+                            notification = notifications.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+
+                await semaphore.acquire()
+                task = asyncio.create_task(_dispatch(notification, semaphore), name=f"{__package__}.{channel}")
+                inflight.add(task)
+                task.add_done_callback(inflight.discard)
+        finally:
+            await NotificationListener._cancel_and_await_tasks(list(inflight))
 
     async def _read_notifications(
         self, queue_per_channel: Dict[str, "asyncio.Queue[Notification]"], check_interval: float
@@ -136,6 +158,7 @@ class NotificationListener:
         while True:
             try:
                 connection = await self._connect()
+                failed_connect_attempts = 1
                 try:
 
                     await connection.execute(f"SET application_name TO 'PgBusHost-{'-'.join(queue_per_channel.keys())}'")
@@ -143,15 +166,16 @@ class NotificationListener:
                     for channel, queue in queue_per_channel.items():
                         await connection.add_listener(channel, self._get_push_callback(queue))
 
-                    while True:
+                    while not connection.is_closed():
                         await asyncio.sleep(check_interval)
-                        await connection.execute("SELECT 1")
                 finally:
                     await asyncio.shield(connection.close())
             except Exception:
                 logger.exception(f"Connection was lost or not established - attempted {failed_connect_attempts} times....")
-                # await asyncio.sleep(self._reconnect_delay ** min(failed_connect_attempts, 5))
-                await asyncio.sleep(self._reconnect_delay * failed_connect_attempts)
+                backoff = self._reconnect_delay * (2 ** (failed_connect_attempts - 1))
+                backoff = min(backoff, 60)
+                backoff *= random.uniform(0.5, 1.5)
+                await asyncio.sleep(backoff)
                 failed_connect_attempts += 1
                 if failed_connect_attempts > 10:
                     raise Exception("Too many failed connection attempts")
