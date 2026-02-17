@@ -49,13 +49,12 @@ async def main():
         handler_function='TestHandler.run', run_as_subprocess=True ) )
 
 
-    # for i in range(3):
-    #     # await pg_bus.send(queue_name='test', message_type='print', payload=f'message #{i} to be printed by test!')
+    for i in range(30):
+        await pg_bus.send(queue_name='test', message_type='print', payload=f'message #{i} to be printed by test!')
     #     await pg_bus.send(queue_name='test', message_type='print', payload=f'message #{i} to be printed by test2!')
     #     await pg_bus.send(queue_name='test', message_type='sleep', payload=f'{i*1}')
     #     # await pg_bus.send(queue_name='test2', message_type='asleep', payload=f'{i*2}')
     #     # time.sleep(4)
-    await pg_bus.send(queue_name='test', message_type='print', payload='Another message to be printed!')
     # await pg_bus.send(queue_name='test', message_type='defer', payload='1')
     # await pg_bus.send(queue_name='test', message_type='raise', payload='testing failure')
     # # await pg_bus.send(queue_name='test', message_type='sleep', payload='40')

@@ -28,19 +28,20 @@ class PgBusRegistration(BaseModel):
     topic_name: str|None = None
     description: str|None = None
     handler_function: str
-    run_as_subprocess: bool|None = Field(default=False)
-    is_active: bool|None = Field(default=True)
-    prevent_duplication: bool|None = Field(default=True)
+    run_as_subprocess: bool = Field(default=False)
+    is_active: bool = Field(default=True)
+    prevent_duplication: bool = Field(default=True)
     inserted_at: datetime.datetime|None = None
     updated_at: datetime.datetime|None = None
     keep_log: bool|None = Field(default=False)
 
 
 class PgBusHostSettings(BaseSettings):
-    retry_count: int|None = Field(default=3)
-    retry_wait_time: float|None = Field(default=2)
-    timeout_in_minutes: int|None = Field(default=1)
-    handler_object_cached_duration: int|None = Field(default=0)
+    retry_count: int = Field(default=3)
+    retry_wait_time: float = Field(default=2)
+    timeout_in_minutes: int = Field(default=1)
+    handler_object_cached_duration: int = Field(default=0)
+    max_workers_per_queue: int = Field(default=1)
 
     model_config = SettingsConfigDict(env_file_encoding='utf-8',
                                       env_prefix="",
