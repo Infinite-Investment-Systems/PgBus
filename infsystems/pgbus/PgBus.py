@@ -1,8 +1,9 @@
 import uuid6
 import logging
 import logging.handlers
-from ..bus.BaseBus import *
-from typing import Dict
+import asyncpg
+from infsystems.pgbus.bus_model import PgBusRegistration,PgBusMessage
+from infsystems.pgbus.BaseBus import BasePgBus
 
 
 class PgBus(BasePgBus):
@@ -15,7 +16,7 @@ class PgBus(BasePgBus):
         if not self._logger.handlers:
             self._logger = logging.getLogger('infinite.PgBus')
 
-        self.registration_map: Dict[str, PgBusRegistration] = dict()
+        self.registration_map: dict[str, PgBusRegistration] = dict()
 
     @classmethod
     async def from_connection_string(cls,
@@ -46,7 +47,7 @@ class PgBus(BasePgBus):
                       topic_name: str,
                       payload: str,
                       priority: int = 0,
-                      correlation_key: Optional[str] = None,
+                      correlation_key: str|None = None,
                       conn: asyncpg.connection.Connection = None
                       ) -> None:
 
@@ -124,9 +125,9 @@ class PgBus(BasePgBus):
 
 
     # @with_optional_connection()
-    async def send(self, queue_name: str, message_type: str, payload: str, priority: Optional[int] = 0,
-                   correlation_key: Optional[str] = None, conn: Optional[asyncpg.connection.Connection] = None) -> None:
-
+    async def send(self, queue_name: str, message_type: str, payload: str, priority: int|None = 0,
+                   correlation_key: str|None = None,
+                   conn: asyncpg.connection.Connection|None = None) -> bool:
         reg = await self._get_registration(queue_name, message_type)
 
         if not reg.is_active:
@@ -145,9 +146,9 @@ class PgBus(BasePgBus):
                     conn=conn,
                     for_deferral=False):
 
-                self._logger.warning(f'Found existing duplicated messages in queue"'
-                                     f'f" {message_type}@{queue_name} with the same payload!')
-                return
+                self._logger.warning(f'Found existing duplicated messages in queue'
+                                     f'{message_type}@{queue_name} with the same payload!')
+                return False
 
             message = PgBusMessage(
                 key=str(uuid6.uuid7()),
@@ -157,12 +158,16 @@ class PgBus(BasePgBus):
                 priority=priority,
                 correlation_key=correlation_key)
 
+            self._logger.debug(f'Sending {message.model_dump_json()}')
+
             async with conn.transaction():
                 stmt = "SELECT pg_notify($1, $2);"
                 await conn.fetchval(stmt, queue_name, message.key)
                 await self._insert_message(message=message, conn=conn, minutes_in_future=0)
 
                 self._logger.info("inserted one message into queue")
+
+            return True
 
         except Exception as ex:
             self._logger.exception(ex)
@@ -175,7 +180,7 @@ class PgBus(BasePgBus):
     async def defer(self,
                     message: PgBusMessage,
                     minutes_in_future: int,
-                    conn: asyncpg.connection.Connection = None) -> None:
+                    conn: asyncpg.connection.Connection = None) -> bool:
         needs_new_conn = not conn
         if needs_new_conn:
             conn = await self.pool.acquire()
@@ -193,7 +198,7 @@ class PgBus(BasePgBus):
                         ):
                     self._logger.info(
                         f"message {message.message_type}@{message.queue_name} has been already deferred!")
-                    return
+                    return False
 
                 message_copy = message.model_copy(deep=True)
                 message_copy.key = str(uuid6.uuid7())
@@ -211,6 +216,8 @@ class PgBus(BasePgBus):
         finally:
             if needs_new_conn and conn:
                 await conn.close()
+
+        return True
 
     @staticmethod
     def get_registration_map_key(queue_name, message_type):

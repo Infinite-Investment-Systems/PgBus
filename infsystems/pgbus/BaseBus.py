@@ -1,6 +1,6 @@
 import asyncpg
 import abc
-from ..bus.bus_model import *
+from infsystems.pgbus.bus_model import PgBusMessage
 
 
 class BasePgBus(metaclass=abc.ABCMeta):
@@ -13,7 +13,7 @@ class BasePgBus(metaclass=abc.ABCMeta):
                       topic_name: str,
                       payload: str,
                       priority: int = 0,
-                      correlation_key: Optional[str] = None,
+                      correlation_key: str|None = None,
                       conn: asyncpg.connection.Connection = None
                       ) -> None:
         """
@@ -34,7 +34,7 @@ class BasePgBus(metaclass=abc.ABCMeta):
 
     @abc.abstractmethod
     async def send(self, queue_name: str, message_type: str, payload: str, priority: int = 0,
-                   correlation_key: Optional[str] = None, conn: asyncpg.connection.Connection = None) -> None:
+                   correlation_key: str|None = None, conn: asyncpg.connection.Connection = None) -> bool:
         """
         Send a "COMMAND" to a given queue. Think of this as a request for execution. (Fire-and-Forget pattern)
         You need to register the queue by adding a record in pgbus_registration table.
@@ -46,6 +46,9 @@ class BasePgBus(metaclass=abc.ABCMeta):
             correlation_key: To correlate messages that are part of a given workflow.
             conn: Postgres connection object to ensure the integrity of database transaction with message processing.
                   Transaction consistency can be only ensured for queues that run_as_subprocess is set to False.
+
+        Returns:
+            A boolean indicating whether the message was sent.
         """
         raise NotImplementedError('This is an abstract class.')
 
@@ -53,7 +56,7 @@ class BasePgBus(metaclass=abc.ABCMeta):
     async def defer(self,
                     message: PgBusMessage,
                     minutes_in_future: int,
-                    conn: asyncpg.connection.Connection = None) -> None:
+                    conn: asyncpg.connection.Connection = None) -> bool:
         """
         Defer a message to be processed in the future. Since We rely on Postgres NOTIFY and LISTEN features,
         and we can't broadcast in future without running a CRON, we can't guarantee the deferral shorter than 1 minute.
@@ -64,6 +67,9 @@ class BasePgBus(metaclass=abc.ABCMeta):
             minutes_in_future: Number of minutes in the future.
             conn: Postgres connection object to ensure the integrity of database transaction with message processing.
                   Transaction consistency can be only ensured for queues that run_as_subprocess is set to False.
+
+        Returns:
+            A boolean indicating whether the message was sent.
         """
         raise NotImplementedError('This is an abstract class.')
 

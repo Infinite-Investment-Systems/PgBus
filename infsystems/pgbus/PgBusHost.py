@@ -1,19 +1,23 @@
-import contextlib
-import gc
-import logging.handlers
+from infsystems.pgbus.bus_model import NoRetryException,PgBusRegistration
+import infsystems.pgbus.pgbus_listener as pgbus_listener
+from infsystems.pgbus.PgBusSubProcessFork import *
+from infsystems.pgbus.PgBusHandlerContext import *
+from infsystems.pgbus.PgBus import PgBus
+from importlib import import_module
+import datetime
 import inspect
-import logging.handlers
-from typing import List
-import asyncpg_listen
+import contextlib
+import asyncpg
 import psutil
-from ..bus.PgBusSubProcessFork import *
-
+import uuid6
+import gc
 
 class PgBusHost:
     def __init__(self,
                  bus: PgBus,
                  connection_string_bypassed_pgbouncer: str,
                  setting: PgBusHostSettings | None = None,
+                 context_object_in_proc: Any|None = None,
                  logger: logging.Logger | None = None):
 
         self._connection_string = connection_string_bypassed_pgbouncer
@@ -35,7 +39,7 @@ class PgBusHost:
         self._reconnect_delay = 5.0
         self._listener_map = dict()
         self._puller_tasks = list()
-        self._host_pool: asyncpg.Pool | None = None
+        self._context_object_in_proc = context_object_in_proc
         self.status: str | None = None
 
     def _get_process_memory(self) -> float:
@@ -46,6 +50,26 @@ class PgBusHost:
             self._logger.exception(f"Error in calling memory_info", exc_info=True)
             return 0
 
+    @staticmethod
+    def import_from_string(path: str):
+        if not path:
+            raise ValueError("Path must not be empty!")
+
+        # if the path is to a module
+        try:
+            module = import_module(path)
+            print(module)
+            return module
+
+        # if the path is to a attribute of a module (func/class/etc)
+        except ImportError:
+            filepath, attr_name = path.rsplit('.', 1)
+            module = import_module(filepath)
+            if not module or not hasattr(module, attr_name):
+                raise ImportError(f'Cannot import "{attr_name}" from "{filepath}"!')
+            attr = getattr(module, attr_name)
+            return attr
+
     async def _get_registration_for_message(self, message: PgBusMessage) -> PgBusRegistration:
         map_key = PgBus.get_registration_map_key(message.queue_name, message.message_type)
         if map_key not in self._bus.registration_map:
@@ -55,7 +79,7 @@ class PgBusHost:
         return self._bus.registration_map[map_key]
 
     async def _process_message(self, message: PgBusMessage, conn: asyncpg.connection.Connection) -> None:
-        self._logger.info(f'processing {message.payload} from {message.queue_name}....')
+        self._logger.info(f'processing {message.payload} from {message.queue_name} with correlation key {message.correlation_key}....')
 
         registration = await self._get_registration_for_message(message)
 
@@ -66,10 +90,11 @@ class PgBusHost:
                                     message=message,
                                     handler_function=registration.handler_function)
         else:
-            processor = locate(registration.handler_function)
+            processor = PgBusHost.import_from_string(registration.handler_function)
             context = PgBusHandlerContext(setting=self._setting,
                                           bus=self._bus,
-                                          shared_pg_connection=conn)
+                                          shared_pg_connection=conn,
+                                          context_object_in_proc=self._context_object_in_proc)
             # noinspection PyCallingNonCallable
             await processor(context=context, message=message)
         self._logger.debug(f'Finished calling {registration.handler_function}.')
@@ -83,13 +108,6 @@ class PgBusHost:
             with contextlib.suppress(asyncio.CancelledError):
                 await t
         self._puller_tasks = []
-        if not self._host_pool:
-            self._logger.warning('Start had not been called successfully before!')
-            return
-        try:
-            await self._host_pool.close()
-        except (Exception,):
-            pass
 
     async def _add_to_message_log(self,
                                   message: PgBusMessage,
@@ -160,7 +178,7 @@ class PgBusHost:
                              queue_name: str,
                              conn: asyncpg.connection.Connection) -> PgBusMessage | None:
 
-        self.status = f'Last pull at: {datetime.datetime.now()}'
+        self.status = f'Last pull at: {datetime.datetime.now(datetime.timezone.utc)}'
 
         stmt = """WITH msg AS (
                 SELECT 
@@ -193,11 +211,11 @@ class PgBusHost:
             self._logger.debug(f'No messages were found in {queue_name}')
             return None
         self._logger.debug(f'Pulled the following message: {row}')
-        return PgBusMessage.construct(**row)
+        return PgBusMessage.model_construct(**row)
 
     async def register(self, registration: PgBusRegistration) -> None:
 
-        proc_func = locate(registration.handler_function)
+        proc_func = PgBusHost.import_from_string(registration.handler_function)
         # noinspection PyTypeChecker
         func_signature = inspect.signature(proc_func)
         param_dict = dict(func_signature.parameters)
@@ -227,7 +245,7 @@ class PgBusHost:
                 registration.keep_log)
             self._logger.debug(f'Registration for {registration.queue_name} completed!')
 
-    async def _remove_unregistered_queue(self, queue_list: List[str]):
+    async def _remove_unregistered_queue(self, queue_list: list[str]):
         await self._bus.build_registration_map()
 
         for queue_name in queue_list[:]:
@@ -240,7 +258,19 @@ class PgBusHost:
                 self._logger.warning(f'Queue {queue_name} has not been registered before!')
                 queue_list.remove(queue_name)
 
-    async def start(self, queue_list: List[str]):
+    def connect_func(self) -> pgbus_listener.ConnectFunc:
+        async def _connect() -> asyncpg.Connection:
+
+            return await asyncpg.connect(
+                self._connection_string,
+                statement_cache_size=0,
+                server_settings={'application_name': f"PgBusHost"},
+                timeout=5,
+                command_timeout=10)
+
+        return _connect
+
+    async def start(self, queue_list: list[str]):
 
         if self._setting.timeout_in_minutes <= 0:
             raise ValueError('timeout_in_minutes should be at least one minute!')
@@ -252,40 +282,30 @@ class PgBusHost:
             self._logger.warning('There was no registered queues in the provided list !')
             return
 
-        self._host_pool = await asyncpg.create_pool(
-            self._connection_string,
-            statement_cache_size=0,
-            server_settings={'application_name': 'PgBusHost-Pool'},
-            min_size=len(queue_list),
-            max_size=len(queue_list)+1,
-            timeout=5,
-            command_timeout=10,
-            max_inactive_connection_lifetime=self._setting.timeout_in_minutes * 120)
-
         self._logger.info(f'Starting the listeners for {queue_list} queues.')
 
         # to process existing messages in the queue which were posted when no active listener existed
         puller_tasks = [self._process_messages(queue_name) for queue_name in queue_list]
         await asyncio.gather(*puller_tasks)
 
-        listener = asyncpg_listen.NotificationListener(self._host_pool.acquire)
+        listener = pgbus_listener.NotificationListener(self.connect_func())
 
         self._logger.debug(f'Starting {len(queue_list)} listeners now...')
 
         await listener.run(
             {q: self._create_notification_handler(q) for q in queue_list},
-            policy=asyncpg_listen.ListenPolicy.LAST,
+            policy=pgbus_listener.ListenPolicy.LAST,
             notification_timeout=self._setting.timeout_in_minutes * 60)
 
     def _create_notification_handler(
             self,
-            queue_name: str) -> asyncpg_listen.NotificationHandler:
+            queue_name: str) -> pgbus_listener.NotificationHandler:
         _queue_name = queue_name
 
-        async def notification_handler(notification: asyncpg_listen.Notification) -> None:
+        async def notification_handler(notification: pgbus_listener.Notification) -> None:
             if notification.channel != _queue_name:
                 raise Exception(f'notification for {notification.channel} is dispatched for {_queue_name} handler!')
-            if isinstance(notification, asyncpg_listen.Timeout):
+            if isinstance(notification, pgbus_listener.Timeout):
                 self._logger.debug(notification)
 
             await self._process_messages(_queue_name)

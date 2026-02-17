@@ -4,10 +4,10 @@ import platform
 import traceback
 # noinspection PyProtectedMember
 from pydoc import locate
-from ..bus.PgBusHandlerContext import *
+from infsystems.pgbus.PgBusHandlerContext import *
 import asyncio
 from dotenv import load_dotenv
-import json
+from infsystems.pgbus.bus_model import PgBusMessage
 
 
 class NoRetryException(Exception):
