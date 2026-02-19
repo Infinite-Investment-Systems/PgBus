@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field, StringConstraints
+from pydantic import BaseModel, Field, StringConstraints,ConfigDict
 from typing_extensions import Annotated
 from pydantic_settings import BaseSettings, SettingsConfigDict
 import datetime
@@ -8,6 +8,7 @@ class PgBusMessage(BaseModel):
     """
     The data structure for storing messages
     """
+    model_config = ConfigDict(slots=True)
     key: Annotated[str|None, StringConstraints(max_length=60, strip_whitespace=True)] = None
     queue_name: Annotated[str|None, StringConstraints(max_length=60, strip_whitespace=True)] = None
     message_type: Annotated[str|None, StringConstraints(max_length=128, strip_whitespace=True)] = None
@@ -22,6 +23,7 @@ class PgBusRegistration(BaseModel):
     """
     The data structure for registering queues, topics, and processing functions
     """
+    model_config = ConfigDict(slots=True)
     id: int|None = None
     queue_name: str
     message_type: str

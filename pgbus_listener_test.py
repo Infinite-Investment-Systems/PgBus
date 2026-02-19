@@ -24,7 +24,7 @@ async def main():
         setting=settings,
         logger=_logger)
 
-    await bus_host.start(['test']) #, 'test2', 'test3'])
+    await bus_host.start(['test1','test2']) #, 'test2', 'test3'])
 
 if __name__ == '__main__':
 

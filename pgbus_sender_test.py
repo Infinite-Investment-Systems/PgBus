@@ -22,18 +22,25 @@ async def main():
         logger=_logger)
 
     await bus_host.register(PgBusRegistration(
-        queue_name='test',
+        queue_name='test1',
         message_type='print',
         keep_log=True,
         handler_function='TestHandler.run',
         run_as_subprocess=False))
 
     await bus_host.register(PgBusRegistration(
-        queue_name='test',
-        message_type='raise',
+        queue_name='test2',
+        message_type='print',
         keep_log=True,
         handler_function='TestHandler.run',
         run_as_subprocess=False))
+
+    # await bus_host.register(PgBusRegistration(
+    #     queue_name='test',
+    #     message_type='raise',
+    #     keep_log=True,
+    #     handler_function='TestHandler.run',
+    #     run_as_subprocess=False))
 
     await bus_host.register(PgBusRegistration(
         queue_name='test',
@@ -50,7 +57,7 @@ async def main():
 
 
     for i in range(30):
-        await pg_bus.send(queue_name='test', message_type='print', payload=f'message #{i} to be printed by test!')
+        await pg_bus.send(queue_name=f'test{"1" if i%2==0 else "2"}', message_type='print', payload=f'message #{i} to be printed by test!')
     #     await pg_bus.send(queue_name='test', message_type='print', payload=f'message #{i} to be printed by test2!')
     #     await pg_bus.send(queue_name='test', message_type='sleep', payload=f'{i*1}')
     #     # await pg_bus.send(queue_name='test2', message_type='asleep', payload=f'{i*2}')
